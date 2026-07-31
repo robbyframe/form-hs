@@ -100,6 +100,12 @@ export default function AssessmentApp() {
     };
   }, []);
 
+  useEffect(() => {
+    if (config && config.title) {
+      document.title = config.title;
+    }
+  }, [config]);
+
   function handleFieldChange(fieldId, val) {
     setFormValues((prev) => ({ ...prev, [fieldId]: val }));
     setFormErr("");

@@ -61,6 +61,26 @@ git push -u origin main
 4. Klik **Deploy**. Setelah selesai, Anda dapat link seperti
    `nama-project.vercel.app` — inilah yang dibagikan ke audiens.
 
+## Judul thumbnail link (WhatsApp/Telegram/dll) otomatis ikut admin panel
+
+Project ini sudah dilengkapi `middleware.js` yang jalan otomatis di Vercel
+(Edge Middleware). Saat link dibuka oleh bot pembuat preview (WhatsApp,
+Telegram, Facebook, dll — dikenali dari user-agent-nya), server akan
+mengambil judul & subjudul terbaru langsung dari Supabase dan mengirimkannya
+sebagai judul thumbnail. Jadi begitu Anda ganti judul di panel admin, link
+yang sama otomatis menampilkan judul baru di thumbnail — tidak perlu
+redeploy manual lagi.
+
+Tidak ada langkah tambahan yang perlu dilakukan — middleware ini otomatis
+aktif begitu di-deploy ke Vercel, dan memakai environment variable yang sama
+(`VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`) yang sudah Anda isi di
+Langkah 5.
+
+Catatan: aplikasi WhatsApp/Telegram biasanya nge-cache thumbnail lama untuk
+link yang sama selama beberapa waktu. Kalau setelah ganti judul thumbnail
+masih menampilkan yang lama, coba kirim link dengan sedikit tambahan di
+akhir (misal `?v=2`) supaya dianggap link baru dan cache lama dilewati.
+
 ## Catatan penting soal keamanan
 
 Tabel Supabase di sini dibuat **terbuka** (siapa saja yang tahu Project URL +
