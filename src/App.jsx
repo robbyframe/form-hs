@@ -15,7 +15,7 @@ function slugify(str) {
     .slice(0, 40);
 }
 
-const DEFAULT_QUESTIONS = [
+const DEFAULT_QUESTION_TEXTS = [
   "Saya merasa percaya diri saat berbicara di depan kamera.",
   "Saya mampu menjaga kontak mata dengan audiens virtual.",
   "Saya mampu mengatur intonasi suara agar tidak monoton.",
@@ -39,7 +39,11 @@ const FIELD_TYPES = [
   { value: "tel", label: "Nomor HP" },
 ];
 
-const SCALE_OPTIONS = [4, 5];
+const SCALE_OPTIONS = [4, 5, 10];
+
+function newQuestion(text) {
+  return { id: genId("q"), text: text || "", scoreMode: "normal", manualScores: {} };
+}
 
 function defaultConfig(title) {
   return {
@@ -48,10 +52,57 @@ function defaultConfig(title) {
     minLabel: "Sangat Tidak Setuju",
     maxLabel: "Sangat Setuju",
     scaleMax: 5,
-    fields: DEFAULT_FIELDS,
-    questions: DEFAULT_QUESTIONS,
+    fields: DEFAULT_FIELDS.map((f) => ({ ...f })),
+    questions: DEFAULT_QUESTION_TEXTS.map((t) => newQuestion(t)),
     closed: false,
   };
+}
+
+// Menjaga kompatibilitas dengan data lama (pertanyaan berupa string polos,
+// scaleMax belum ada, dll) supaya tidak error saat dibaca ulang.
+function normalizeConfig(raw) {
+  const base = defaultConfig(raw && raw.title);
+  const cfg = { ...base, ...raw };
+  cfg.fields = raw && Array.isArray(raw.fields) && raw.fields.length ? raw.fields : base.fields;
+  cfg.scaleMax = raw && SCALE_OPTIONS.includes(raw.scaleMax) ? raw.scaleMax : base.scaleMax;
+  const srcQuestions = (raw && Array.isArray(raw.questions) && raw.questions.length) ? raw.questions : base.questions;
+  cfg.questions = srcQuestions.map((q) =>
+    typeof q === "string"
+      ? newQuestion(q)
+      : {
+          id: q.id || genId("q"),
+          text: q.text || "",
+          scoreMode: q.scoreMode === "manual" ? "manual" : "normal",
+          manualScores: q.manualScores && typeof q.manualScores === "object" ? q.manualScores : {},
+        }
+  );
+  return cfg;
+}
+
+function ensureManualScores(q, scaleMax) {
+  const out = {};
+  for (let v = 1; v <= scaleMax; v++) {
+    const raw = q.manualScores ? q.manualScores[v] : undefined;
+    out[v] = raw !== undefined && raw !== null && raw !== "" && !Number.isNaN(Number(raw)) ? Number(raw) : v;
+  }
+  return out;
+}
+
+function questionPoints(q, selectedValue, scaleMax) {
+  if (!selectedValue) return 0;
+  if (q.scoreMode === "manual") {
+    const scores = ensureManualScores(q, scaleMax);
+    return scores[selectedValue] !== undefined ? scores[selectedValue] : selectedValue;
+  }
+  return selectedValue;
+}
+
+function questionMaxPoints(q, scaleMax) {
+  if (q.scoreMode === "manual") {
+    const scores = ensureManualScores(q, scaleMax);
+    return Math.max(...Object.values(scores));
+  }
+  return scaleMax;
 }
 
 const ASSESSMENT_PREFIX = "assessment:";
@@ -123,7 +174,6 @@ export default function AssessmentApp() {
   useEffect(() => {
     let cancelled = false;
     async function load() {
-      // load master admin code (best-effort, falls back to default)
       try {
         const mc = await storage.get(MASTER_CODE_KEY, true);
         if (!cancelled && mc && mc.value) {
@@ -142,7 +192,7 @@ export default function AssessmentApp() {
         const res = await storage.get(ASSESSMENT_PREFIX + assessmentId, true);
         if (cancelled) return;
         if (res && res.value) {
-          const parsed = JSON.parse(res.value);
+          const parsed = normalizeConfig(JSON.parse(res.value));
           setAudienceConfig(parsed);
           setView(parsed.closed ? "closed" : "form");
         } else {
@@ -177,6 +227,9 @@ export default function AssessmentApp() {
   const answeredCount = Object.keys(answers).length;
   const totalQuestions = audienceConfig ? audienceConfig.questions.length : 0;
   const scaleMax = audienceConfig ? audienceConfig.scaleMax || 5 : 5;
+  const maxTotalPoints = audienceConfig
+    ? audienceConfig.questions.reduce((sum, q) => sum + questionMaxPoints(q, scaleMax), 0)
+    : 0;
 
   async function handleSubmit() {
     for (const f of audienceConfig.fields) {
@@ -191,7 +244,10 @@ export default function AssessmentApp() {
     }
     setFormErr("");
     setSubmitting(true);
-    const total = Object.values(answers).reduce((a, b) => a + b, 0);
+    const total = audienceConfig.questions.reduce(
+      (sum, q, i) => sum + questionPoints(q, answers[i], scaleMax),
+      0
+    );
     const id = RESP_PREFIX + assessmentId + ":" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
     const payload = {
       values: formValues,
@@ -334,11 +390,12 @@ export default function AssessmentApp() {
         cfg = defaultConfig();
       }
     }
+    cfg = normalizeConfig(cfg);
     setEditConfig(cfg);
     setDraft({
       ...cfg,
       fields: cfg.fields.map((f) => ({ ...f })),
-      questions: [...cfg.questions],
+      questions: cfg.questions.map((q) => ({ ...q, manualScores: { ...q.manualScores } })),
     });
     setView("admin-edit");
     loadResponses(id);
@@ -370,7 +427,7 @@ export default function AssessmentApp() {
   function validateDraft() {
     if (draft.fields.length === 0) return "Minimal harus ada 1 kolom informasi.";
     if (draft.fields.some((f) => !f.label.trim())) return "Ada kolom informasi dengan label kosong.";
-    const cleanQ = draft.questions.filter((q) => q.trim());
+    const cleanQ = draft.questions.filter((q) => q.text.trim());
     if (cleanQ.length === 0) return "Minimal harus ada 1 pertanyaan.";
     return "";
   }
@@ -382,12 +439,16 @@ export default function AssessmentApp() {
       setSaveMsg(err);
       return;
     }
-    const cleaned = { ...draft, questions: draft.questions.filter((q) => q.trim()) };
+    const cleaned = { ...draft, questions: draft.questions.filter((q) => q.text.trim()) };
     try {
       const res = await storage.set(ASSESSMENT_PREFIX + editingId, JSON.stringify(cleaned), true);
       if (res) {
         setEditConfig(cleaned);
-        setDraft({ ...cleaned, fields: cleaned.fields.map((f) => ({ ...f })), questions: [...cleaned.questions] });
+        setDraft({
+          ...cleaned,
+          fields: cleaned.fields.map((f) => ({ ...f })),
+          questions: cleaned.questions.map((q) => ({ ...q, manualScores: { ...q.manualScores } })),
+        });
         setSaveMsg("Perubahan tersimpan.");
         setAssessmentList((prev) =>
           prev.map((a) => (a.id === editingId ? { ...a, title: cleaned.title, closed: cleaned.closed } : a))
@@ -400,16 +461,27 @@ export default function AssessmentApp() {
     }
   }
 
-  function updateDraftQuestion(i, text) {
+  function updateDraftQuestion(i, patch) {
     setDraft((prev) => {
       const qs = [...prev.questions];
-      qs[i] = text;
+      qs[i] = { ...qs[i], ...patch };
+      return { ...prev, questions: qs };
+    });
+  }
+
+  function updateManualScore(i, choiceValue, rawInput) {
+    setDraft((prev) => {
+      const qs = [...prev.questions];
+      const q = qs[i];
+      const scores = { ...(q.manualScores || {}) };
+      scores[choiceValue] = rawInput === "" ? "" : Number(rawInput);
+      qs[i] = { ...q, manualScores: scores };
       return { ...prev, questions: qs };
     });
   }
 
   function addQuestion() {
-    setDraft((prev) => ({ ...prev, questions: [...prev.questions, ""] }));
+    setDraft((prev) => ({ ...prev, questions: [...prev.questions, newQuestion("")] }));
   }
 
   function removeQuestion(i) {
@@ -444,13 +516,18 @@ export default function AssessmentApp() {
   }
 
   function exportExcel() {
+    const scaleMaxForExport = editConfig.scaleMax || 5;
     const rows = responses.map((r, i) => {
       const row = { No: i + 1 };
       editConfig.fields.forEach((f) => {
         row[f.label] = (r.values || {})[f.id] || "";
       });
       editConfig.questions.forEach((q, qi) => {
-        row["Q" + (qi + 1)] = r.answers[qi];
+        const selected = r.answers[qi];
+        row["Q" + (qi + 1) + " (jawaban)"] = selected;
+        if (q.scoreMode === "manual") {
+          row["Q" + (qi + 1) + " (poin)"] = questionPoints(q, selected, scaleMaxForExport);
+        }
       });
       row["Total Poin"] = r.total;
       row["Waktu"] = new Date(r.timestamp).toLocaleString("id-ID");
@@ -544,18 +621,21 @@ export default function AssessmentApp() {
       .aa-ghost { background: transparent; color: ${COLORS.muted}; }
       .aa-ghost:hover { color: ${COLORS.ink}; }
       .aa-input, .aa-select { font-family: ${FONT_STACK.body}; border: 1px solid ${COLORS.line}; border-radius: 8px; padding: 10px 12px; font-size: 14px; width: 100%; box-sizing: border-box; background: #fff; }
+      textarea.aa-input { resize: vertical; line-height: 1.5; }
       .aa-scale-row { display: flex; gap: 8px; flex-wrap: wrap; }
       .aa-scale-btn { width: 44px; height: 44px; border-radius: 50%; border: 1.5px solid ${COLORS.line}; background: #fff; font-family: ${FONT_STACK.display}; font-weight: 600; font-size: 15px; color: ${COLORS.ink}; cursor: pointer; transition: all .15s ease; }
       .aa-scale-btn:hover { border-color: ${COLORS.teal}; }
       .aa-scale-btn.selected { background: ${COLORS.teal}; border-color: ${COLORS.teal}; color: #fff; }
       .aa-icon-btn { width: 30px; height: 30px; border-radius: 6px; border: 1px solid ${COLORS.line}; background: #fff; color: ${COLORS.danger}; font-size: 15px; line-height: 1; cursor: pointer; flex-shrink: 0; }
       .aa-icon-btn:hover { background: #FBEAE4; }
+      .aa-score-box { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+      .aa-score-box input { width: 48px; text-align: center; border: 1px solid ${COLORS.line}; border-radius: 6px; padding: 6px 2px; font-size: 13px; font-family: ${FONT_STACK.body}; }
       table.aa-table { width: 100%; border-collapse: collapse; font-size: 13px; }
       table.aa-table th, table.aa-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid ${COLORS.line}; white-space: nowrap; }
       table.aa-table th { color: ${COLORS.muted}; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
       .aa-row-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; border: 1px solid ${COLORS.line}; border-radius: 10px; }
       @media (max-width: 480px) {
-        .aa-scale-btn { width: 38px; height: 38px; font-size: 13px; }
+        .aa-scale-btn { width: 34px; height: 34px; font-size: 12px; }
         .aa-row-card { flex-direction: column; align-items: stretch; }
       }
     `}</style>
@@ -581,7 +661,7 @@ export default function AssessmentApp() {
             <h1 style={{ fontFamily: FONT_STACK.display, fontSize: 22, fontWeight: 700, margin: "0 0 6px" }}>
               {audienceConfig.title}
             </h1>
-            <p style={{ color: COLORS.muted, fontSize: 14, margin: "0 0 24px", lineHeight: 1.5 }}>
+            <p style={{ color: COLORS.muted, fontSize: 14, margin: "0 0 24px", lineHeight: 1.6, whiteSpace: "pre-line" }}>
               {audienceConfig.subtitle}
             </p>
 
@@ -619,9 +699,9 @@ export default function AssessmentApp() {
 
             <div style={{ display: "grid", gap: 22 }}>
               {audienceConfig.questions.map((q, i) => (
-                <div key={i}>
+                <div key={q.id}>
                   <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 10, lineHeight: 1.5 }}>
-                    {i + 1}. {q}
+                    {i + 1}. {q.text}
                   </div>
                   <div className="aa-scale-row">
                     {Array.from({ length: scaleMax }, (_, idx) => idx + 1).map((val) => (
@@ -668,7 +748,7 @@ export default function AssessmentApp() {
             <div style={{ fontFamily: FONT_STACK.display, fontSize: 48, fontWeight: 700, color: COLORS.teal, margin: "4px 0 18px" }}>
               {lastTotal}
             </div>
-            <div style={{ fontSize: 13, color: COLORS.muted }}>dari maksimal {totalQuestions * scaleMax} poin</div>
+            <div style={{ fontSize: 13, color: COLORS.muted }}>dari maksimal {maxTotalPoints} poin</div>
           </div>
         </div>
       )}
@@ -779,11 +859,7 @@ export default function AssessmentApp() {
             <div style={{ marginBottom: 20, padding: 16, border: `1px solid ${COLORS.line}`, borderRadius: 10 }}>
               <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Kode Akses Admin</div>
               <div style={{ display: "flex", gap: 8 }}>
-                <input
-                  className="aa-input"
-                  value={masterCodeDraft}
-                  onChange={(e) => setMasterCodeDraft(e.target.value)}
-                />
+                <input className="aa-input" value={masterCodeDraft} onChange={(e) => setMasterCodeDraft(e.target.value)} />
                 <button
                   className="aa-btn"
                   style={{ padding: "10px 16px", borderRadius: 8, fontWeight: 600, background: COLORS.ink, color: "#fff", whiteSpace: "nowrap" }}
@@ -835,7 +911,7 @@ export default function AssessmentApp() {
 
       {/* ================= ADMIN: EDIT SATU ASESMEN ================= */}
       {view === "admin-edit" && draft && (
-        <div style={{ ...card, maxWidth: 760 }}>
+        <div style={{ ...card, maxWidth: 780 }}>
           <div style={spotlightBar} />
           <div style={{ padding: "24px 28px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
@@ -875,8 +951,15 @@ export default function AssessmentApp() {
                   <input className="aa-input" value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
                 </div>
                 <div>
-                  <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, display: "block" }}>Subjudul / Keterangan</label>
-                  <input className="aa-input" value={draft.subtitle} onChange={(e) => setDraft({ ...draft, subtitle: e.target.value })} />
+                  <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, display: "block" }}>
+                    Subjudul / Keterangan <span style={{ fontWeight: 400, color: COLORS.muted }}>(Enter untuk baris baru)</span>
+                  </label>
+                  <textarea
+                    className="aa-input"
+                    rows={4}
+                    value={draft.subtitle}
+                    onChange={(e) => setDraft({ ...draft, subtitle: e.target.value })}
+                  />
                 </div>
 
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -919,14 +1002,53 @@ export default function AssessmentApp() {
                       + Tambah Pertanyaan
                     </button>
                   </div>
-                  <div style={{ display: "grid", gap: 8 }}>
+                  <div style={{ display: "grid", gap: 10 }}>
                     {draft.questions.map((q, i) => (
-                      <div key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                        <span style={{ fontSize: 12, color: COLORS.muted, width: 18 }}>{i + 1}.</span>
-                        <input className="aa-input" value={q} onChange={(e) => updateDraftQuestion(i, e.target.value)} />
-                        <button className="aa-icon-btn" onClick={() => removeQuestion(i)} title="Hapus pertanyaan">
-                          ✕
-                        </button>
+                      <div key={q.id} style={{ padding: 10, background: COLORS.paper, borderRadius: 8 }}>
+                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                          <span style={{ fontSize: 12, color: COLORS.muted, width: 18 }}>{i + 1}.</span>
+                          <input
+                            className="aa-input"
+                            style={{ background: "#fff" }}
+                            value={q.text}
+                            onChange={(e) => updateDraftQuestion(i, { text: e.target.value })}
+                          />
+                          <button className="aa-icon-btn" onClick={() => removeQuestion(i)} title="Hapus pertanyaan">
+                            ✕
+                          </button>
+                        </div>
+
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, marginLeft: 26 }}>
+                          <span style={{ fontSize: 12, color: COLORS.muted }}>Skor:</span>
+                          <select
+                            className="aa-select"
+                            style={{ width: "auto", background: "#fff", padding: "6px 10px", fontSize: 12 }}
+                            value={q.scoreMode}
+                            onChange={(e) => updateDraftQuestion(i, { scoreMode: e.target.value })}
+                          >
+                            <option value="normal">Normal (sesuai pilihan)</option>
+                            <option value="manual">Manual (atur sendiri)</option>
+                          </select>
+                        </div>
+
+                        {q.scoreMode === "manual" && (
+                          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10, marginLeft: 26 }}>
+                            {Array.from({ length: draft.scaleMax || 5 }, (_, idx) => idx + 1).map((v) => (
+                              <div key={v} className="aa-score-box">
+                                <span style={{ fontSize: 11, color: COLORS.muted }}>pilih {v}</span>
+                                <input
+                                  type="number"
+                                  value={
+                                    q.manualScores && q.manualScores[v] !== undefined && q.manualScores[v] !== ""
+                                      ? q.manualScores[v]
+                                      : v
+                                  }
+                                  onChange={(e) => updateManualScore(i, v, e.target.value)}
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
