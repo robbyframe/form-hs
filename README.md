@@ -1,11 +1,27 @@
 # Asesmen Presentasi Virtual — Versi Vercel
 
 Ini adalah versi deploy-able dari artifact form asesmen yang sudah dibuat di
-Claude. Fungsinya sama persis (form skala 1-5, kolom informasi & pertanyaan
-bisa dikustomisasi dari panel admin, export Excel), hanya saja penyimpanan
-datanya diganti dari `window.storage` (khusus environment Claude) menjadi
-**Supabase** (database gratis) supaya bisa jalan di hosting biasa seperti
-Vercel.
+Claude, dengan penyimpanan data diganti dari `window.storage` (khusus
+environment Claude) menjadi **Supabase** (database gratis) supaya bisa jalan
+di hosting biasa seperti Vercel.
+
+## Satu link, banyak asesmen
+
+Project ini mendukung **banyak jenis asesmen sekaligus** dari satu deployment
+yang sama:
+
+- Setiap asesmen punya link sendiri: `nama-project.vercel.app/?id=<id-asesmen>`
+- Semua asesmen dikelola dari satu **Daftar Asesmen** di panel admin (buat
+  baru, edit pertanyaan/kolom form, buka/tutup, lihat & export hasil, hapus)
+  tanpa perlu deploy ulang atau bikin project baru
+- Panel admin dilindungi **satu kode akses master** (bukan per-asesmen lagi)
+- Skala penilaian tiap asesmen bisa dipilih **1–4** atau **1–5**, diatur
+  sendiri-sendiri per asesmen
+
+Cara masuk ke panel admin: buka link apa saja dari project ini (boleh tanpa
+`?id=`, misal langsung `nama-project.vercel.app`), klik **Masuk sebagai
+admin** di bagian bawah, masukkan kode akses (default: **1234**, segera
+ganti lewat panel setelah masuk pertama kali).
 
 ## Langkah 1 — Buat database di Supabase (gratis)
 
@@ -30,8 +46,9 @@ npm install
 npm run dev
 ```
 
-Buka `http://localhost:5173`, coba isi form dan cek panel admin (kode akses
-default: **1234**, ganti ini nanti di tab Pengaturan).
+Buka `http://localhost:5173`, klik **Masuk sebagai admin** (kode akses
+default: **1234**), buat satu asesmen contoh, lalu buka linknya
+(`?id=<id-yang-dibuat>`) di tab baru untuk coba isi form-nya.
 
 ## Langkah 4 — Push ke GitHub
 
@@ -100,10 +117,17 @@ tidak langsung terbuka ke publik.
 
 ```
 src/
-  App.jsx            — komponen utama form + panel admin (logika sama seperti artifact)
+  App.jsx            — komponen utama: form audiens, daftar asesmen, panel admin per-asesmen
   main.jsx           — entry point React
   supabaseClient.js  — koneksi ke Supabase
   lib/storage.js      — pengganti window.storage, baca/tulis ke Supabase
+middleware.js         — Edge Middleware, judul thumbnail otomatis per asesmen
 supabase_schema.sql  — script bikin tabel di Supabase
 .env.example         — contoh env var yang perlu diisi
 ```
+
+## Skema penyimpanan data (untuk referensi)
+
+- `assessment:<id>` — pengaturan satu asesmen (judul, pertanyaan, kolom form, skala, status buka/tutup)
+- `resp:<id>:<timestamp>-<random>` — satu baris jawaban audiens untuk asesmen `<id>`
+- `master-admin` — kode akses panel admin (berlaku untuk semua asesmen)

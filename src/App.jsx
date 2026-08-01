@@ -6,6 +6,15 @@ function genId(prefix) {
   return prefix + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
+function slugify(str) {
+  return String(str)
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+}
+
 const DEFAULT_QUESTIONS = [
   "Saya merasa percaya diri saat berbicara di depan kamera.",
   "Saya mampu menjaga kontak mata dengan audiens virtual.",
@@ -30,19 +39,25 @@ const FIELD_TYPES = [
   { value: "tel", label: "Nomor HP" },
 ];
 
-const DEFAULT_CONFIG = {
-  title: "Asesmen Kesiapan Presentasi Virtual",
-  subtitle: "Jawab sesuai kondisi Anda saat ini. Tidak ada jawaban salah.",
-  minLabel: "Sangat Tidak Setuju",
-  maxLabel: "Sangat Setuju",
-  fields: DEFAULT_FIELDS,
-  questions: DEFAULT_QUESTIONS,
-  adminCode: "1234",
-  closed: false,
-};
+const SCALE_OPTIONS = [4, 5];
 
-const CONFIG_KEY = "assessment-config";
+function defaultConfig(title) {
+  return {
+    title: title || "Asesmen Baru",
+    subtitle: "Jawab sesuai kondisi Anda saat ini. Tidak ada jawaban salah.",
+    minLabel: "Sangat Tidak Setuju",
+    maxLabel: "Sangat Setuju",
+    scaleMax: 5,
+    fields: DEFAULT_FIELDS,
+    questions: DEFAULT_QUESTIONS,
+    closed: false,
+  };
+}
+
+const ASSESSMENT_PREFIX = "assessment:";
 const RESP_PREFIX = "resp:";
+const MASTER_CODE_KEY = "master-admin";
+const DEFAULT_MASTER_CODE = "1234";
 
 const COLORS = {
   ink: "#16202B",
@@ -62,17 +77,43 @@ const FONT_STACK = {
 };
 
 export default function AssessmentApp() {
-  const [config, setConfig] = useState(null);
+  const [assessmentId] = useState(() => {
+    try {
+      return new URLSearchParams(window.location.search).get("id") || "";
+    } catch (e) {
+      return "";
+    }
+  });
+
   const [view, setView] = useState("loading");
 
+  // ---- audience-facing (assessment loaded from URL ?id=) ----
+  const [audienceConfig, setAudienceConfig] = useState(null);
   const [formValues, setFormValues] = useState({});
   const [answers, setAnswers] = useState({});
   const [submitting, setSubmitting] = useState(false);
   const [lastTotal, setLastTotal] = useState(null);
   const [formErr, setFormErr] = useState("");
 
+  // ---- admin: master gate ----
+  const [masterCode, setMasterCode] = useState(DEFAULT_MASTER_CODE);
   const [adminCodeInput, setAdminCodeInput] = useState("");
   const [adminErr, setAdminErr] = useState("");
+  const [masterCodeDraft, setMasterCodeDraft] = useState("");
+  const [masterCodeMsg, setMasterCodeMsg] = useState("");
+
+  // ---- admin: list of assessments ----
+  const [assessmentList, setAssessmentList] = useState([]);
+  const [loadingList, setLoadingList] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newSlug, setNewSlug] = useState("");
+  const [slugTouched, setSlugTouched] = useState(false);
+  const [createErr, setCreateErr] = useState("");
+  const [copiedId, setCopiedId] = useState("");
+
+  // ---- admin: editing one assessment ----
+  const [editingId, setEditingId] = useState("");
+  const [editConfig, setEditConfig] = useState(null);
   const [draft, setDraft] = useState(null);
   const [adminTab, setAdminTab] = useState("settings");
   const [responses, setResponses] = useState([]);
@@ -82,29 +123,46 @@ export default function AssessmentApp() {
   useEffect(() => {
     let cancelled = false;
     async function load() {
-      let parsed = DEFAULT_CONFIG;
+      // load master admin code (best-effort, falls back to default)
       try {
-        const res = await storage.get(CONFIG_KEY, true);
-        if (res && res.value) parsed = JSON.parse(res.value);
+        const mc = await storage.get(MASTER_CODE_KEY, true);
+        if (!cancelled && mc && mc.value) {
+          const parsed = JSON.parse(mc.value);
+          if (parsed.code) setMasterCode(parsed.code);
+        }
       } catch (e) {
-        parsed = DEFAULT_CONFIG;
+        /* pakai default */
       }
-      if (!cancelled) {
-        setConfig(parsed);
-        setView(parsed.closed ? "closed" : "form");
+
+      if (!assessmentId) {
+        if (!cancelled) setView("not-found");
+        return;
+      }
+      try {
+        const res = await storage.get(ASSESSMENT_PREFIX + assessmentId, true);
+        if (cancelled) return;
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          setAudienceConfig(parsed);
+          setView(parsed.closed ? "closed" : "form");
+        } else {
+          setView("not-found");
+        }
+      } catch (e) {
+        if (!cancelled) setView("not-found");
       }
     }
     load();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [assessmentId]);
 
   useEffect(() => {
-    if (config && config.title) {
-      document.title = config.title;
+    if (audienceConfig && audienceConfig.title) {
+      document.title = audienceConfig.title;
     }
-  }, [config]);
+  }, [audienceConfig]);
 
   function handleFieldChange(fieldId, val) {
     setFormValues((prev) => ({ ...prev, [fieldId]: val }));
@@ -117,10 +175,11 @@ export default function AssessmentApp() {
   }
 
   const answeredCount = Object.keys(answers).length;
-  const totalQuestions = config ? config.questions.length : 0;
+  const totalQuestions = audienceConfig ? audienceConfig.questions.length : 0;
+  const scaleMax = audienceConfig ? audienceConfig.scaleMax || 5 : 5;
 
   async function handleSubmit() {
-    for (const f of config.fields) {
+    for (const f of audienceConfig.fields) {
       if (f.required && !(formValues[f.id] || "").trim()) {
         setFormErr(`"${f.label}" wajib diisi.`);
         return;
@@ -133,7 +192,7 @@ export default function AssessmentApp() {
     setFormErr("");
     setSubmitting(true);
     const total = Object.values(answers).reduce((a, b) => a + b, 0);
-    const id = RESP_PREFIX + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    const id = RESP_PREFIX + assessmentId + ":" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
     const payload = {
       values: formValues,
       answers,
@@ -157,26 +216,138 @@ export default function AssessmentApp() {
     setView("admin-gate");
   }
 
-  function checkAdminCode() {
-    if (adminCodeInput === config.adminCode) {
-      setDraft({
-        ...config,
-        fields: config.fields.map((f) => ({ ...f })),
-        questions: [...config.questions],
-      });
+  function backToAudienceView() {
+    if (!assessmentId) {
+      setView("not-found");
+    } else if (audienceConfig) {
+      setView(audienceConfig.closed ? "closed" : "form");
+    } else {
+      setView("not-found");
+    }
+  }
+
+  function checkMasterCode() {
+    if (adminCodeInput === masterCode) {
       setAdminErr("");
-      setAdminTab("settings");
-      setView("admin");
-      loadResponses();
+      setMasterCodeDraft(masterCode);
+      setMasterCodeMsg("");
+      setView("admin-list");
+      loadAssessmentList();
     } else {
       setAdminErr("Kode akses salah.");
     }
   }
 
-  async function loadResponses() {
+  async function saveMasterCode() {
+    setMasterCodeMsg("");
+    if (!masterCodeDraft.trim()) {
+      setMasterCodeMsg("Kode tidak boleh kosong.");
+      return;
+    }
+    try {
+      const res = await storage.set(MASTER_CODE_KEY, JSON.stringify({ code: masterCodeDraft.trim() }), true);
+      if (res) {
+        setMasterCode(masterCodeDraft.trim());
+        setMasterCodeMsg("Kode akses admin diperbarui.");
+      } else {
+        setMasterCodeMsg("Gagal menyimpan.");
+      }
+    } catch (e) {
+      setMasterCodeMsg("Gagal menyimpan.");
+    }
+  }
+
+  async function loadAssessmentList() {
+    setLoadingList(true);
+    try {
+      const listRes = await storage.list(ASSESSMENT_PREFIX, true);
+      const keys = listRes && listRes.keys ? listRes.keys : [];
+      const items = [];
+      for (const k of keys) {
+        try {
+          const r = await storage.get(k, true);
+          if (r && r.value) {
+            const cfg = JSON.parse(r.value);
+            items.push({ id: k.slice(ASSESSMENT_PREFIX.length), title: cfg.title, closed: cfg.closed });
+          }
+        } catch (e) {
+          /* lewati entri rusak */
+        }
+      }
+      items.sort((a, b) => a.title.localeCompare(b.title));
+      setAssessmentList(items);
+    } catch (e) {
+      setAssessmentList([]);
+    } finally {
+      setLoadingList(false);
+    }
+  }
+
+  function handleNewTitleChange(val) {
+    setNewTitle(val);
+    if (!slugTouched) setNewSlug(slugify(val));
+  }
+
+  async function createAssessment() {
+    setCreateErr("");
+    const title = newTitle.trim();
+    const slug = slugify(newSlug);
+    if (!title) {
+      setCreateErr("Judul asesmen wajib diisi.");
+      return;
+    }
+    if (!slug) {
+      setCreateErr("ID link wajib diisi (huruf/angka/tanda strip).");
+      return;
+    }
+    if (assessmentList.some((a) => a.id === slug)) {
+      setCreateErr("ID link ini sudah dipakai asesmen lain. Pilih ID lain.");
+      return;
+    }
+    try {
+      const cfg = defaultConfig(title);
+      const res = await storage.set(ASSESSMENT_PREFIX + slug, JSON.stringify(cfg), true);
+      if (!res) {
+        setCreateErr("Gagal membuat asesmen.");
+        return;
+      }
+      setNewTitle("");
+      setNewSlug("");
+      setSlugTouched(false);
+      await loadAssessmentList();
+      openEditAssessment(slug, cfg);
+    } catch (e) {
+      setCreateErr("Gagal membuat asesmen.");
+    }
+  }
+
+  async function openEditAssessment(id, preloadedCfg) {
+    setEditingId(id);
+    setSaveMsg("");
+    setAdminTab("settings");
+    let cfg = preloadedCfg;
+    if (!cfg) {
+      try {
+        const res = await storage.get(ASSESSMENT_PREFIX + id, true);
+        cfg = res && res.value ? JSON.parse(res.value) : defaultConfig();
+      } catch (e) {
+        cfg = defaultConfig();
+      }
+    }
+    setEditConfig(cfg);
+    setDraft({
+      ...cfg,
+      fields: cfg.fields.map((f) => ({ ...f })),
+      questions: [...cfg.questions],
+    });
+    setView("admin-edit");
+    loadResponses(id);
+  }
+
+  async function loadResponses(id) {
     setLoadingResponses(true);
     try {
-      const listRes = await storage.list(RESP_PREFIX, true);
+      const listRes = await storage.list(RESP_PREFIX + id + ":", true);
       const keys = listRes && listRes.keys ? listRes.keys : [];
       const items = [];
       for (const k of keys) {
@@ -213,11 +384,14 @@ export default function AssessmentApp() {
     }
     const cleaned = { ...draft, questions: draft.questions.filter((q) => q.trim()) };
     try {
-      const res = await storage.set(CONFIG_KEY, JSON.stringify(cleaned), true);
+      const res = await storage.set(ASSESSMENT_PREFIX + editingId, JSON.stringify(cleaned), true);
       if (res) {
-        setConfig(cleaned);
+        setEditConfig(cleaned);
         setDraft({ ...cleaned, fields: cleaned.fields.map((f) => ({ ...f })), questions: [...cleaned.questions] });
         setSaveMsg("Perubahan tersimpan.");
+        setAssessmentList((prev) =>
+          prev.map((a) => (a.id === editingId ? { ...a, title: cleaned.title, closed: cleaned.closed } : a))
+        );
       } else {
         setSaveMsg("Gagal menyimpan perubahan.");
       }
@@ -272,10 +446,10 @@ export default function AssessmentApp() {
   function exportExcel() {
     const rows = responses.map((r, i) => {
       const row = { No: i + 1 };
-      config.fields.forEach((f) => {
+      editConfig.fields.forEach((f) => {
         row[f.label] = (r.values || {})[f.id] || "";
       });
-      config.questions.forEach((q, qi) => {
+      editConfig.questions.forEach((q, qi) => {
         row["Q" + (qi + 1)] = r.answers[qi];
       });
       row["Total Poin"] = r.total;
@@ -285,11 +459,11 @@ export default function AssessmentApp() {
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Hasil Asesmen");
-    XLSX.writeFile(wb, "hasil-asesmen-" + Date.now() + ".xlsx");
+    XLSX.writeFile(wb, "hasil-" + editingId + "-" + Date.now() + ".xlsx");
   }
 
   async function clearResponses() {
-    if (!window.confirm("Hapus semua data hasil asesmen? Tindakan ini tidak bisa dibatalkan.")) return;
+    if (!window.confirm("Hapus semua data hasil asesmen ini? Tindakan ini tidak bisa dibatalkan.")) return;
     try {
       for (const r of responses) {
         await storage.delete(r.key, true);
@@ -298,6 +472,36 @@ export default function AssessmentApp() {
       setSaveMsg("Semua data hasil telah dihapus.");
     } catch (e) {
       setSaveMsg("Sebagian data gagal dihapus.");
+    }
+  }
+
+  async function deleteAssessment(id, title) {
+    if (!window.confirm(`Hapus asesmen "${title}" beserta semua hasilnya? Tindakan ini tidak bisa dibatalkan.`)) return;
+    try {
+      await storage.delete(ASSESSMENT_PREFIX + id, true);
+      const listRes = await storage.list(RESP_PREFIX + id + ":", true);
+      const keys = listRes && listRes.keys ? listRes.keys : [];
+      for (const k of keys) {
+        await storage.delete(k, true);
+      }
+      setAssessmentList((prev) => prev.filter((a) => a.id !== id));
+    } catch (e) {
+      window.alert("Gagal menghapus sebagian data.");
+    }
+  }
+
+  function assessmentLink(id) {
+    return `${window.location.origin}${window.location.pathname}?id=${id}`;
+  }
+
+  async function copyLink(id) {
+    const link = assessmentLink(id);
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopiedId(id);
+      setTimeout(() => setCopiedId(""), 2000);
+    } catch (e) {
+      window.prompt("Salin link ini secara manual:", link);
     }
   }
 
@@ -326,57 +530,63 @@ export default function AssessmentApp() {
     background: `linear-gradient(90deg, ${COLORS.teal}, ${COLORS.gold})`,
   };
 
-  if (view === "loading" || !config) {
+  const globalStyle = (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Inter:wght@400;500;600&display=swap');
+      .aa-btn { cursor: pointer; border: none; font-family: ${FONT_STACK.body}; transition: background .15s ease, transform .1s ease, box-shadow .15s ease; }
+      .aa-btn:active { transform: translateY(1px); }
+      .aa-btn:disabled { cursor: not-allowed; opacity: .55; }
+      .aa-btn:focus-visible, .aa-scale-btn:focus-visible, .aa-input:focus-visible, .aa-input:focus, .aa-select:focus-visible {
+        outline: 2px solid ${COLORS.teal}; outline-offset: 2px;
+      }
+      .aa-primary { background: ${COLORS.teal}; color: #fff; }
+      .aa-primary:hover:not(:disabled) { background: ${COLORS.tealDark}; }
+      .aa-ghost { background: transparent; color: ${COLORS.muted}; }
+      .aa-ghost:hover { color: ${COLORS.ink}; }
+      .aa-input, .aa-select { font-family: ${FONT_STACK.body}; border: 1px solid ${COLORS.line}; border-radius: 8px; padding: 10px 12px; font-size: 14px; width: 100%; box-sizing: border-box; background: #fff; }
+      .aa-scale-row { display: flex; gap: 8px; flex-wrap: wrap; }
+      .aa-scale-btn { width: 44px; height: 44px; border-radius: 50%; border: 1.5px solid ${COLORS.line}; background: #fff; font-family: ${FONT_STACK.display}; font-weight: 600; font-size: 15px; color: ${COLORS.ink}; cursor: pointer; transition: all .15s ease; }
+      .aa-scale-btn:hover { border-color: ${COLORS.teal}; }
+      .aa-scale-btn.selected { background: ${COLORS.teal}; border-color: ${COLORS.teal}; color: #fff; }
+      .aa-icon-btn { width: 30px; height: 30px; border-radius: 6px; border: 1px solid ${COLORS.line}; background: #fff; color: ${COLORS.danger}; font-size: 15px; line-height: 1; cursor: pointer; flex-shrink: 0; }
+      .aa-icon-btn:hover { background: #FBEAE4; }
+      table.aa-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      table.aa-table th, table.aa-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid ${COLORS.line}; white-space: nowrap; }
+      table.aa-table th { color: ${COLORS.muted}; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+      .aa-row-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; border: 1px solid ${COLORS.line}; border-radius: 10px; }
+      @media (max-width: 480px) {
+        .aa-scale-btn { width: 38px; height: 38px; font-size: 13px; }
+        .aa-row-card { flex-direction: column; align-items: stretch; }
+      }
+    `}</style>
+  );
+
+  if (view === "loading") {
     return (
       <div style={{ ...wrap, display: "flex", alignItems: "center", justifyContent: "center" }}>
-        <div style={{ color: COLORS.muted, fontFamily: FONT_STACK.body }}>Memuat asesmen…</div>
+        <div style={{ color: COLORS.muted, fontFamily: FONT_STACK.body }}>Memuat…</div>
       </div>
     );
   }
 
   return (
     <div style={wrap}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Inter:wght@400;500;600&display=swap');
-        .aa-btn { cursor: pointer; border: none; font-family: ${FONT_STACK.body}; transition: background .15s ease, transform .1s ease, box-shadow .15s ease; }
-        .aa-btn:active { transform: translateY(1px); }
-        .aa-btn:disabled { cursor: not-allowed; opacity: .55; }
-        .aa-btn:focus-visible, .aa-scale-btn:focus-visible, .aa-input:focus-visible, .aa-input:focus, .aa-select:focus-visible {
-          outline: 2px solid ${COLORS.teal}; outline-offset: 2px;
-        }
-        .aa-primary { background: ${COLORS.teal}; color: #fff; }
-        .aa-primary:hover:not(:disabled) { background: ${COLORS.tealDark}; }
-        .aa-ghost { background: transparent; color: ${COLORS.muted}; }
-        .aa-ghost:hover { color: ${COLORS.ink}; }
-        .aa-input, .aa-select { font-family: ${FONT_STACK.body}; border: 1px solid ${COLORS.line}; border-radius: 8px; padding: 10px 12px; font-size: 14px; width: 100%; box-sizing: border-box; background: #fff; }
-        .aa-scale-row { display: flex; gap: 8px; flex-wrap: wrap; }
-        .aa-scale-btn { width: 44px; height: 44px; border-radius: 50%; border: 1.5px solid ${COLORS.line}; background: #fff; font-family: ${FONT_STACK.display}; font-weight: 600; font-size: 15px; color: ${COLORS.ink}; cursor: pointer; transition: all .15s ease; }
-        .aa-scale-btn:hover { border-color: ${COLORS.teal}; }
-        .aa-scale-btn.selected { background: ${COLORS.teal}; border-color: ${COLORS.teal}; color: #fff; }
-        .aa-icon-btn { width: 30px; height: 30px; border-radius: 6px; border: 1px solid ${COLORS.line}; background: #fff; color: ${COLORS.danger}; font-size: 15px; line-height: 1; cursor: pointer; flex-shrink: 0; }
-        .aa-icon-btn:hover { background: #FBEAE4; }
-        table.aa-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        table.aa-table th, table.aa-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid ${COLORS.line}; white-space: nowrap; }
-        table.aa-table th { color: ${COLORS.muted}; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
-        @media (max-width: 480px) {
-          .aa-scale-btn { width: 38px; height: 38px; font-size: 13px; }
-        }
-      `}</style>
+      {globalStyle}
 
-      {/* ================= FORM VIEW ================= */}
-      {view === "form" && (
+      {/* ================= FORM VIEW (AUDIENS) ================= */}
+      {view === "form" && audienceConfig && (
         <div style={card}>
           <div style={spotlightBar} />
           <div style={{ padding: "28px 28px 24px" }}>
             <h1 style={{ fontFamily: FONT_STACK.display, fontSize: 22, fontWeight: 700, margin: "0 0 6px" }}>
-              {config.title}
+              {audienceConfig.title}
             </h1>
             <p style={{ color: COLORS.muted, fontSize: 14, margin: "0 0 24px", lineHeight: 1.5 }}>
-              {config.subtitle}
+              {audienceConfig.subtitle}
             </p>
 
             <div style={{ display: "grid", gap: 14, marginBottom: 24 }}>
-              {config.fields.map((f) => (
+              {audienceConfig.fields.map((f) => (
                 <div key={f.id}>
                   <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, display: "block" }}>
                     {f.label}
@@ -393,15 +603,7 @@ export default function AssessmentApp() {
               ))}
             </div>
 
-            <div
-              style={{
-                height: 6,
-                borderRadius: 3,
-                background: COLORS.line,
-                overflow: "hidden",
-                marginBottom: 6,
-              }}
-            >
+            <div style={{ height: 6, borderRadius: 3, background: COLORS.line, overflow: "hidden", marginBottom: 6 }}>
               <div
                 style={{
                   height: "100%",
@@ -416,13 +618,13 @@ export default function AssessmentApp() {
             </div>
 
             <div style={{ display: "grid", gap: 22 }}>
-              {config.questions.map((q, i) => (
+              {audienceConfig.questions.map((q, i) => (
                 <div key={i}>
                   <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 10, lineHeight: 1.5 }}>
                     {i + 1}. {q}
                   </div>
                   <div className="aa-scale-row">
-                    {[1, 2, 3, 4, 5].map((val) => (
+                    {Array.from({ length: scaleMax }, (_, idx) => idx + 1).map((val) => (
                       <button
                         key={val}
                         type="button"
@@ -435,16 +637,14 @@ export default function AssessmentApp() {
                     ))}
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: COLORS.muted, marginTop: 6 }}>
-                    <span>{config.minLabel}</span>
-                    <span>{config.maxLabel}</span>
+                    <span>{audienceConfig.minLabel}</span>
+                    <span>{audienceConfig.maxLabel}</span>
                   </div>
                 </div>
               ))}
             </div>
 
-            {formErr && (
-              <div style={{ color: COLORS.danger, fontSize: 13, marginTop: 18 }}>{formErr}</div>
-            )}
+            {formErr && <div style={{ color: COLORS.danger, fontSize: 13, marginTop: 18 }}>{formErr}</div>}
 
             <button
               className="aa-btn aa-primary"
@@ -468,9 +668,7 @@ export default function AssessmentApp() {
             <div style={{ fontFamily: FONT_STACK.display, fontSize: 48, fontWeight: 700, color: COLORS.teal, margin: "4px 0 18px" }}>
               {lastTotal}
             </div>
-            <div style={{ fontSize: 13, color: COLORS.muted }}>
-              dari maksimal {totalQuestions * 5} poin
-            </div>
+            <div style={{ fontSize: 13, color: COLORS.muted }}>dari maksimal {totalQuestions * scaleMax} poin</div>
           </div>
         </div>
       )}
@@ -490,6 +688,21 @@ export default function AssessmentApp() {
         </div>
       )}
 
+      {/* ================= NOT FOUND / LANDING ================= */}
+      {view === "not-found" && (
+        <div style={card}>
+          <div style={spotlightBar} />
+          <div style={{ padding: "40px 28px", textAlign: "center" }}>
+            <div style={{ fontFamily: FONT_STACK.display, fontSize: 18, fontWeight: 700, marginBottom: 8 }}>
+              Asesmen tidak ditemukan
+            </div>
+            <div style={{ fontSize: 14, color: COLORS.muted }}>
+              Link ini tidak valid atau asesmen sudah tidak tersedia. Hubungi penyelenggara untuk link yang benar.
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ================= ADMIN GATE ================= */}
       {view === "admin-gate" && (
         <div style={{ ...card, maxWidth: 380 }}>
@@ -504,14 +717,14 @@ export default function AssessmentApp() {
               placeholder="Kode akses"
               value={adminCodeInput}
               onChange={(e) => setAdminCodeInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && checkAdminCode()}
+              onKeyDown={(e) => e.key === "Enter" && checkMasterCode()}
             />
             {adminErr && <div style={{ color: COLORS.danger, fontSize: 13, marginTop: 8 }}>{adminErr}</div>}
             <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
-              <button className="aa-btn aa-primary" style={{ flex: 1, padding: "10px", borderRadius: 8, fontWeight: 600 }} onClick={checkAdminCode}>
+              <button className="aa-btn aa-primary" style={{ flex: 1, padding: "10px", borderRadius: 8, fontWeight: 600 }} onClick={checkMasterCode}>
                 Masuk
               </button>
-              <button className="aa-btn aa-ghost" style={{ padding: "10px" }} onClick={() => setView(config.closed ? "closed" : "form")}>
+              <button className="aa-btn aa-ghost" style={{ padding: "10px" }} onClick={backToAudienceView}>
                 Batal
               </button>
             </div>
@@ -519,17 +732,119 @@ export default function AssessmentApp() {
         </div>
       )}
 
-      {/* ================= ADMIN PANEL ================= */}
-      {view === "admin" && draft && (
+      {/* ================= ADMIN: DAFTAR ASESMEN ================= */}
+      {view === "admin-list" && (
         <div style={{ ...card, maxWidth: 760 }}>
           <div style={spotlightBar} />
           <div style={{ padding: "24px 28px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
-              <div style={{ fontFamily: FONT_STACK.display, fontSize: 18, fontWeight: 700 }}>Panel Admin</div>
-              <button className="aa-btn aa-ghost" style={{ fontSize: 13 }} onClick={() => setView(config.closed ? "closed" : "form")}>
+              <div style={{ fontFamily: FONT_STACK.display, fontSize: 18, fontWeight: 700 }}>Daftar Asesmen</div>
+              <button className="aa-btn aa-ghost" style={{ fontSize: 13 }} onClick={backToAudienceView}>
                 Keluar
               </button>
             </div>
+
+            <div style={{ marginBottom: 24, padding: 16, background: COLORS.paper, borderRadius: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Buat Asesmen Baru</div>
+              <div style={{ display: "grid", gap: 8 }}>
+                <input
+                  className="aa-input"
+                  placeholder="Judul asesmen, mis. Training Sales Batch Januari"
+                  value={newTitle}
+                  onChange={(e) => handleNewTitleChange(e.target.value)}
+                />
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <span style={{ fontSize: 12, color: COLORS.muted, whiteSpace: "nowrap" }}>?id=</span>
+                  <input
+                    className="aa-input"
+                    placeholder="id-link-asesmen"
+                    value={newSlug}
+                    onChange={(e) => {
+                      setSlugTouched(true);
+                      setNewSlug(slugify(e.target.value));
+                    }}
+                  />
+                </div>
+                {createErr && <div style={{ color: COLORS.danger, fontSize: 13 }}>{createErr}</div>}
+                <button
+                  className="aa-btn aa-primary"
+                  style={{ padding: "10px 16px", borderRadius: 8, fontWeight: 600, justifySelf: "start" }}
+                  onClick={createAssessment}
+                >
+                  + Buat Asesmen
+                </button>
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 20, padding: 16, border: `1px solid ${COLORS.line}`, borderRadius: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Kode Akses Admin</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  className="aa-input"
+                  value={masterCodeDraft}
+                  onChange={(e) => setMasterCodeDraft(e.target.value)}
+                />
+                <button
+                  className="aa-btn"
+                  style={{ padding: "10px 16px", borderRadius: 8, fontWeight: 600, background: COLORS.ink, color: "#fff", whiteSpace: "nowrap" }}
+                  onClick={saveMasterCode}
+                >
+                  Simpan
+                </button>
+              </div>
+              {masterCodeMsg && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 6 }}>{masterCodeMsg}</div>}
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>Semua Asesmen ({assessmentList.length})</div>
+              <button className="aa-btn aa-ghost" style={{ fontSize: 12 }} onClick={loadAssessmentList}>
+                {loadingList ? "Memuat…" : "Muat Ulang"}
+              </button>
+            </div>
+
+            {assessmentList.length === 0 ? (
+              <div style={{ fontSize: 13, color: COLORS.muted, padding: "16px 0" }}>Belum ada asesmen dibuat.</div>
+            ) : (
+              <div style={{ display: "grid", gap: 10 }}>
+                {assessmentList.map((a) => (
+                  <div key={a.id} className="aa-row-card">
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 2 }}>{a.title}</div>
+                      <div style={{ fontSize: 12, color: COLORS.muted, overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {assessmentLink(a.id)} {a.closed ? "· ditutup" : ""}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                      <button className="aa-btn" style={{ padding: "7px 12px", borderRadius: 7, fontSize: 12, border: `1px solid ${COLORS.line}`, background: "#fff" }} onClick={() => copyLink(a.id)}>
+                        {copiedId === a.id ? "Tersalin!" : "Salin Link"}
+                      </button>
+                      <button className="aa-btn aa-primary" style={{ padding: "7px 12px", borderRadius: 7, fontSize: 12, fontWeight: 600 }} onClick={() => openEditAssessment(a.id)}>
+                        Kelola
+                      </button>
+                      <button className="aa-icon-btn" onClick={() => deleteAssessment(a.id, a.title)} title="Hapus asesmen">
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ================= ADMIN: EDIT SATU ASESMEN ================= */}
+      {view === "admin-edit" && draft && (
+        <div style={{ ...card, maxWidth: 760 }}>
+          <div style={spotlightBar} />
+          <div style={{ padding: "24px 28px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <div style={{ fontFamily: FONT_STACK.display, fontSize: 18, fontWeight: 700 }}>{editConfig.title}</div>
+              <button className="aa-btn aa-ghost" style={{ fontSize: 13 }} onClick={() => setView("admin-list")}>
+                ← Daftar Asesmen
+              </button>
+            </div>
+            <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 18 }}>{assessmentLink(editingId)}</div>
 
             <div style={{ display: "flex", gap: 4, marginBottom: 20, borderBottom: `1px solid ${COLORS.line}` }}>
               {["settings", "fields", "results"].map((t) => (
@@ -563,14 +878,33 @@ export default function AssessmentApp() {
                   <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, display: "block" }}>Subjudul / Keterangan</label>
                   <input className="aa-input" value={draft.subtitle} onChange={(e) => setDraft({ ...draft, subtitle: e.target.value })} />
                 </div>
+
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                   <div>
                     <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, display: "block" }}>Label Skala Terendah (1)</label>
                     <input className="aa-input" value={draft.minLabel} onChange={(e) => setDraft({ ...draft, minLabel: e.target.value })} />
                   </div>
                   <div>
-                    <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, display: "block" }}>Label Skala Tertinggi (5)</label>
+                    <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, display: "block" }}>Label Skala Tertinggi</label>
                     <input className="aa-input" value={draft.maxLabel} onChange={(e) => setDraft({ ...draft, maxLabel: e.target.value })} />
+                  </div>
+                </div>
+
+                <div>
+                  <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, display: "block" }}>Skala Penilaian</label>
+                  <select
+                    className="aa-select"
+                    value={draft.scaleMax || 5}
+                    onChange={(e) => setDraft({ ...draft, scaleMax: Number(e.target.value) })}
+                  >
+                    {SCALE_OPTIONS.map((n) => (
+                      <option key={n} value={n}>
+                        1 – {n}
+                      </option>
+                    ))}
+                  </select>
+                  <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 6 }}>
+                    Perubahan skala hanya berlaku untuk pengisian baru; jawaban yang sudah masuk tidak berubah.
                   </div>
                 </div>
 
@@ -596,11 +930,6 @@ export default function AssessmentApp() {
                       </div>
                     ))}
                   </div>
-                </div>
-
-                <div>
-                  <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, display: "block" }}>Kode Akses Admin</label>
-                  <input className="aa-input" value={draft.adminCode} onChange={(e) => setDraft({ ...draft, adminCode: e.target.value })} />
                 </div>
 
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", background: COLORS.paper, borderRadius: 8 }}>
@@ -670,11 +999,7 @@ export default function AssessmentApp() {
                         onChange={(e) => updateDraftField(i, { label: e.target.value })}
                         placeholder="Label kolom, mis. Nomor HP"
                       />
-                      <select
-                        className="aa-select"
-                        value={f.type}
-                        onChange={(e) => updateDraftField(i, { type: e.target.value })}
-                      >
+                      <select className="aa-select" value={f.type} onChange={(e) => updateDraftField(i, { type: e.target.value })}>
                         {FIELD_TYPES.map((t) => (
                           <option key={t.value} value={t.value}>
                             {t.label}
@@ -682,11 +1007,7 @@ export default function AssessmentApp() {
                         ))}
                       </select>
                       <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: COLORS.muted, whiteSpace: "nowrap" }}>
-                        <input
-                          type="checkbox"
-                          checked={f.required}
-                          onChange={(e) => updateDraftField(i, { required: e.target.checked })}
-                        />
+                        <input type="checkbox" checked={f.required} onChange={(e) => updateDraftField(i, { required: e.target.checked })} />
                         Wajib
                       </label>
                       <button className="aa-icon-btn" onClick={() => removeField(i)} title="Hapus kolom">
@@ -708,7 +1029,7 @@ export default function AssessmentApp() {
             {adminTab === "results" && (
               <div>
                 <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
-                  <button className="aa-btn aa-ghost" style={{ border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 14px", fontSize: 13 }} onClick={loadResponses}>
+                  <button className="aa-btn aa-ghost" style={{ border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 14px", fontSize: 13 }} onClick={() => loadResponses(editingId)}>
                     {loadingResponses ? "Memuat…" : "Muat Ulang"}
                   </button>
                   <button
@@ -730,15 +1051,13 @@ export default function AssessmentApp() {
                 </div>
 
                 {responses.length === 0 ? (
-                  <div style={{ fontSize: 13, color: COLORS.muted, padding: "20px 0" }}>
-                    Belum ada jawaban masuk.
-                  </div>
+                  <div style={{ fontSize: 13, color: COLORS.muted, padding: "20px 0" }}>Belum ada jawaban masuk.</div>
                 ) : (
                   <div style={{ overflowX: "auto" }}>
                     <table className="aa-table">
                       <thead>
                         <tr>
-                          {config.fields.map((f) => (
+                          {editConfig.fields.map((f) => (
                             <th key={f.id}>{f.label}</th>
                           ))}
                           <th>Total</th>
@@ -748,7 +1067,7 @@ export default function AssessmentApp() {
                       <tbody>
                         {responses.map((r) => (
                           <tr key={r.key}>
-                            {config.fields.map((f) => (
+                            {editConfig.fields.map((f) => (
                               <td key={f.id}>{(r.values || {})[f.id] || "-"}</td>
                             ))}
                             <td style={{ fontWeight: 700, color: COLORS.teal }}>{r.total}</td>
@@ -765,7 +1084,7 @@ export default function AssessmentApp() {
         </div>
       )}
 
-      {(view === "form" || view === "thankyou" || view === "closed") && (
+      {(view === "form" || view === "thankyou" || view === "closed" || view === "not-found") && (
         <div style={{ maxWidth: 640, margin: "16px auto 0", textAlign: "center" }}>
           <button className="aa-btn aa-ghost" style={{ fontSize: 12, textDecoration: "underline" }} onClick={openAdminGate}>
             Masuk sebagai admin
