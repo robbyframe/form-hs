@@ -316,16 +316,14 @@ export default function AssessmentApp() {
   async function loadAssessmentList() {
     setLoadingList(true);
     try {
-      const listRes = await storage.list(ASSESSMENT_PREFIX, true);
-      const keys = listRes && listRes.keys ? listRes.keys : [];
+      const res = await storage.listWithValues(ASSESSMENT_PREFIX, true);
+      const rows = res && res.items ? res.items : [];
       const items = [];
-      for (const k of keys) {
+      for (const row of rows) {
         try {
-          const r = await storage.get(k, true);
-          if (r && r.value) {
-            const cfg = JSON.parse(r.value);
-            items.push({ id: k.slice(ASSESSMENT_PREFIX.length), title: cfg.title, closed: cfg.closed });
-          }
+          if (!row.value) continue;
+          const cfg = JSON.parse(row.value);
+          items.push({ id: row.key.slice(ASSESSMENT_PREFIX.length), title: cfg.title, closed: cfg.closed });
         } catch (e) {
           /* lewati entri rusak */
         }
@@ -404,13 +402,13 @@ export default function AssessmentApp() {
   async function loadResponses(id) {
     setLoadingResponses(true);
     try {
-      const listRes = await storage.list(RESP_PREFIX + id + ":", true);
-      const keys = listRes && listRes.keys ? listRes.keys : [];
+      const res = await storage.listWithValues(RESP_PREFIX + id + ":", true);
+      const rows = res && res.items ? res.items : [];
       const items = [];
-      for (const k of keys) {
+      for (const row of rows) {
         try {
-          const r = await storage.get(k, true);
-          if (r && r.value) items.push({ key: k, ...JSON.parse(r.value) });
+          if (!row.value) continue;
+          items.push({ key: row.key, ...JSON.parse(row.value) });
         } catch (e) {
           /* skip broken entry */
         }
@@ -542,13 +540,11 @@ export default function AssessmentApp() {
   async function clearResponses() {
     if (!window.confirm("Hapus semua data hasil asesmen ini? Tindakan ini tidak bisa dibatalkan.")) return;
     try {
-      for (const r of responses) {
-        await storage.delete(r.key, true);
-      }
+      await storage.deleteByPrefix(RESP_PREFIX + editingId + ":", true);
       setResponses([]);
       setSaveMsg("Semua data hasil telah dihapus.");
     } catch (e) {
-      setSaveMsg("Sebagian data gagal dihapus.");
+      setSaveMsg("Gagal menghapus data.");
     }
   }
 
@@ -556,11 +552,7 @@ export default function AssessmentApp() {
     if (!window.confirm(`Hapus asesmen "${title}" beserta semua hasilnya? Tindakan ini tidak bisa dibatalkan.`)) return;
     try {
       await storage.delete(ASSESSMENT_PREFIX + id, true);
-      const listRes = await storage.list(RESP_PREFIX + id + ":", true);
-      const keys = listRes && listRes.keys ? listRes.keys : [];
-      for (const k of keys) {
-        await storage.delete(k, true);
-      }
+      await storage.deleteByPrefix(RESP_PREFIX + id + ":", true);
       setAssessmentList((prev) => prev.filter((a) => a.id !== id));
     } catch (e) {
       window.alert("Gagal menghapus sebagian data.");
